@@ -16,6 +16,8 @@ from datetime import datetime
 from email.message import EmailMessage
 from typing import Any, Callable, Optional
 from urllib.parse import quote_plus
+
+from ..core.config import normalize_gotify_priority
 from ..core.onebot import OneBotHTTP
 from ..core.qq_bot import QQBot
 from ..core.captcha import DAMAGOU_BALANCE_INSUFFICIENT_MESSAGE
@@ -142,6 +144,7 @@ def _send_exchange(
     access_token = str(push.get("access_token") or "").strip()
     send_id = str(push.get("send_id") or "").strip()
     msg_type = str(push.get("msg_type") or "").strip()
+    protocol = str(push.get("protocol") or "").strip().lower()
 
     smtp_host = str(push.get("smtp_host") or "").strip()
     smtp_port = int(push.get("smtp_port") or 465)
@@ -193,18 +196,29 @@ def _send_exchange(
         require(send_id, "send_id")
         require(msg_type, "msg_type")
         if msg_type == "group":
-            message_type = 'group'
+            message_type = "group"
             user_id = None
             group_id = send_id
         elif msg_type == "private":
-            message_type = 'private'
+            message_type = "private"
             user_id = send_id
             group_id = None
+        else:
+            raise ValueError("msg_type must be 'group' or 'private'")
 
         text = build_exchange_text(title, goods_name, result, plan, success)
-        bot = OneBotHTTP(base_url=push_url, access_token=access_token)
+        bot = OneBotHTTP(
+            base_url=push_url,
+            access_token=access_token,
+            protocol=protocol,
+        )
         try:
-            bot.send_msg(user_id=user_id, group_id=group_id, message=text, message_type=message_type)
+            bot.send_msg(
+                user_id=user_id,
+                group_id=group_id,
+                message=text,
+                message_type=message_type,
+            )
         except Exception as ex:
             raise ValueError(f"QQ推送通道暂不可用，{ex}")
         return
@@ -276,6 +290,10 @@ def _send_exchange(
         )
         return
 
+    if provider == "gotify":
+        send_gotify(client, push, title, build_exchange_markdown(title, goods_name, result, plan, success))
+        return
+
     raise ValueError(f"不支持的推送通道: {provider}")
 
 
@@ -300,6 +318,7 @@ def _send(
     access_token = str(push.get("access_token") or "").strip()
     send_id = str(push.get("send_id") or "").strip()
     msg_type = str(push.get("msg_type") or "").strip()
+    protocol = str(push.get("protocol") or "").strip().lower()
 
     smtp_host = str(push.get("smtp_host") or "").strip()
     smtp_port = int(push.get("smtp_port") or 465)
@@ -318,13 +337,15 @@ def _send(
         require(msg_type, "msg_type")
         # 消息类型
         if msg_type == "group":
-            message_type = 'group'
+            message_type = "group"
             user_id = None
             group_id = send_id
         elif msg_type == "private":
-            message_type = 'private'
+            message_type = "private"
             user_id = send_id
             group_id = None
+        else:
+            raise ValueError("msg_type must be 'group' or 'private'")
 
         lines = message.splitlines()
 
@@ -343,9 +364,18 @@ def _send(
                 continue
             filtered.append(line)
 
-        bot = OneBotHTTP(base_url = push_url, access_token = access_token)
+        bot = OneBotHTTP(
+            base_url=push_url,
+            access_token=access_token,
+            protocol=protocol,
+        )
         try:
-            bot.send_msg(user_id = user_id, group_id = group_id, message = '\n'.join(filtered), message_type = message_type)
+            bot.send_msg(
+                user_id=user_id,
+                group_id=group_id,
+                message="\n".join(filtered),
+                message_type=message_type,
+            )
         except Exception as ex:
             raise ValueError(f"QQ推送通道暂不可用，{ex}")
         return
@@ -428,7 +458,41 @@ def _send(
         )
         return
 
+    if provider == "gotify":
+        send_gotify(client, push, title, markdown_message)
+        return
+
     raise ValueError(f"不支持的推送通道: {provider}")
+
+
+def send_gotify(client: httpx.Client, push: dict[str, Any], title: str, message: str) -> None:
+    """发送 Gotify 通知。"""
+    server = str(push.get("server") or "").strip().rstrip("/")
+    token = str(push.get("token") or "").strip()
+    require(server, "server")
+    require(token, "token")
+    # token 放请求头而不是 ?token=：HTTPStatusError 的文本带完整 URL，会连同 token 一起进推送结果和日志
+    response = client.post(
+        f"{server}/message",
+        headers={"X-Gotify-Key": token},
+        json={
+            "title": title,
+            "message": message,
+            "priority": normalize_gotify_priority(push.get("priority")),
+            # Gotify 默认按纯文本展示，要让它渲染 Markdown 得显式声明 content type
+            "extras": {"client::display": {"contentType": "text/markdown"}},
+        },
+        # 公共 client 会跟随重定向，而 301/302 会把 POST 改成不带正文的 GET，还会把 token 带给跳转的目标主机
+        follow_redirects=False,
+    )
+    if response.is_redirect:
+        raise ValueError(
+            f"Gotify 服务器返回了重定向（HTTP {response.status_code}），请检查服务器地址的 http/https 是否写对"
+        )
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise ValueError(f"Gotify 请求失败：HTTP {exc.response.status_code}") from None
 
 
 def build_push_html(title: str, message: str, success: bool) -> str:
@@ -688,8 +752,15 @@ def build_exchange_template_context(
     """为商品兑换构建推送模板上下文"""
     status = "兑换成功" if success else "兑换失败"
     retcode = result.get("retcode", -1)
+    # 执行本身出了异常时没有返回码
+    retcode_text = "-" if retcode is None else str(retcode)
     message = result.get("message", "未知结果")
     attempt = result.get("attempt", 1)
+    # 虚拟商品才有游戏角色，实体商品没有这一行
+    role = " / ".join(part for part in (plan.get("role_name"), plan.get("uid")) if part)
+    # 失败后计划已自动续到商品的下一次开抢时，多说明一句
+    rescheduled = str(result.get("rescheduled_text") or "")
+    reschedule_note = f"🔁 已自动顺延到下次兑换时间 {rescheduled}，届时会继续尝试。" if rescheduled else ""
 
     # 商品信息
     price = plan.get("price", 0)
@@ -718,13 +789,25 @@ def build_exchange_template_context(
         "account_name": html.escape(account_name),
         "account_name_text": account_name,
         "retcode": str(retcode),
+        "retcode_text": retcode_text,
         "message": html.escape(message),
         "message_text": message,
         "attempt": str(attempt),
         "exchange_time": exchange_time,
         "icon_html": icon_html,
-        "detail_html": html.escape(f"结果：{message}({retcode})，尝试 {attempt} 次"),
-        "detail_text": f"结果：{message}({retcode})，尝试 {attempt} 次",
+        "detail_html": html.escape(f"结果：{message}({retcode_text})，尝试 {attempt} 次"),
+        "detail_text": f"结果：{message}({retcode_text})，尝试 {attempt} 次",
+        "role_line_text": f"角色：{role}\n" if role else "",
+        "role_line_markdown": f"> 🎮 **角色：**{role}\n" if role else "",
+        "role_line_html": f"🎮 <b>角色：</b>{html.escape(role)}\n" if role else "",
+        "reschedule_line_text": f"\n{reschedule_note}" if reschedule_note else "",
+        "reschedule_line_markdown": f"\n> {reschedule_note}" if reschedule_note else "",
+        "reschedule_line_html": f"\n{html.escape(reschedule_note)}" if reschedule_note else "",
+        "reschedule_note_html": (
+            f'<div style="font-size:13px;margin-top:8px;color:#102033;">{html.escape(reschedule_note)}</div>'
+            if reschedule_note
+            else ""
+        ),
     }
 
 
@@ -830,7 +913,7 @@ def build_bbs_section_html(summary: dict[str, Any]) -> str:
         <div style="padding:8px 0;border-top:1px solid #edf3f8;">
           <div style="font-size:13px;margin-bottom:4px;">
             <b style="color:#102033;">{html.escape(task["name"])}</b>
-            <span style="float:right;color:{html.escape(task["color"])};">{html.escape(task["label"])} · {task["done"]}/{task["total"]}</span>
+            <span style="float:right;color:{html.escape(task["color"])};">{html.escape(task_status_text(task))}</span>
           </div>
           {segmented_progress_html(task["done_percent"], task["failed_percent"], "", compact=True)}
         </div>
@@ -848,6 +931,13 @@ def build_bbs_section_html(summary: dict[str, Any]) -> str:
       {task_rows}
     </div>
     """.strip()
+
+
+def task_status_text(task: dict[str, Any]) -> str:
+    """没开启的任务只显示「跳过」，不带 0/0 计数。"""
+    if task["skipped"]:
+        return task["label"]
+    return f"{task['label']} · {task['done']}/{task['total']}"
 
 
 def section_empty_html(title: str, message: str) -> str:
@@ -935,7 +1025,10 @@ def build_bbs_section_text(summary: dict[str, Any], markdown: bool = False) -> s
     ]
     for task in bbs["tasks"]:
         bar = segmented_text_bar(task["done_percent"], task["failed_percent"])
-        lines.append(f"- {task['name']} {bar} {task['label']} ({task['done']}/{task['total']})")
+        if task["skipped"]:
+            lines.append(f"- {task['name']} {task['label']}")
+        else:
+            lines.append(f"- {task['name']} {bar} {task['label']} ({task['done']}/{task['total']})")
     if bbs["summary"]:
         lines.append(f"- {bbs['summary']}")
     return "\n".join(lines)
@@ -1158,6 +1251,11 @@ def task_progress(
     fail_keywords: tuple[str, ...],
     captcha_scene: str = "",
 ) -> dict[str, Any]:
+    if any(line.startswith(f"{name}未开启") for line in lines):
+        return {
+            "name": name, "done": 0, "total": 0, "failed": 0, "skipped": True,
+            "done_percent": 0, "failed_percent": 0, "label": "跳过", "color": "#627389",
+        }
     completed_by_skip = any(any(keyword in line for keyword in skip_keywords) for line in lines)
     started = sum(1 for line in lines if start_matcher(line))
     done = count_task_items(success_items, item_keywords)
@@ -1183,6 +1281,7 @@ def task_progress(
         "done": min(done, total),
         "total": total,
         "failed": failed,
+        "skipped": False,
         "done_percent": status["done_percent"],
         "failed_percent": status["failed_percent"],
         "label": status["label"],
